@@ -8,7 +8,9 @@
   },
   "scripts": {
     "dev": "pnpm tsx src/cli.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "bundle": "node scripts/bundle.mjs",
+    "build:binaries": "pnpm build && pnpm bundle && node scripts/build-binaries.mjs"
   },
   "keywords": [],
   "author": "",
@@ -25,6 +27,8 @@
     "commander": "^15.0.0",
     "crack-head": "link:",
     "ink": "^7.1.1",
+    "ink-big-text": "^2.0.0",
+    "ink-gradient": "^4.0.1",
     "ink-spinner": "^5.0.0",
     "ink-text-input": "^6.0.0",
     "react": "^19.2.8"
@@ -32,6 +36,8 @@
   "devDependencies": {
     "@types/node": "^26.2.0",
     "@types/react": "^19.2.18",
+    "@yao-pkg/pkg": "^6.22.0",
+    "esbuild": "^0.28.2",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2"
   }

@@ -9,6 +9,11 @@ import {
 import { extractAllXmlContent, extractXmlContent } from "../utils/xml-utils.js";
 import { executeAgentSwarm, formatSwarmEvent } from "./execute-agent-swarm.js";
 
+// Hard caps so a model that keeps calling tools without ever calling finish
+// can't loop forever (and can't wedge the swarm that awaits it).
+const MAX_ITERATIONS = 25;
+const MAX_TOOL_REPEATS = 3;
+
 type Message = {
   role: "system" | "user" | "assistant";
   content: string;
@@ -24,8 +29,6 @@ export class Agent extends EventEmitter {
   pending_commands: string[];
   pending_tool_call: string[];
   conversations: Message[];
-  provider: string;
-  model: string;
   stop_loop_signal: boolean;
   loop_running: boolean;
   latest_tool_output: string;
@@ -45,8 +48,6 @@ export class Agent extends EventEmitter {
       role: "system",
       content: getAgentSystemprompt(formatAvailableToolsXml()),
     });
-    this.provider = "open-router";
-    this.model = "openai/gpt-4o-mini";
     this.stop_loop_signal = false;
     this.loop_running = false;
     this.latest_tool_output = "";
@@ -59,6 +60,24 @@ export class Agent extends EventEmitter {
 
   stopLoop = () => {
     this.stop_loop_signal = true;
+    this.latest_tool_output = "";
+    this.latest_summary = "";
+    this.current_task = "";
+    this.latest_sub_agents_response = "";
+    this.result = "";
+  };
+
+  // Ends the run: records the outcome, surfaces it on the agent's channel, and
+  // clears the per-iteration state so the while-loop condition goes falsy.
+  endRun = (message: string) => {
+    this.result = message;
+    this.emit(
+      this.type == AGENT_TYPE.AGENT ? "parent" : "swarm",
+      `> ${message}`,
+    );
+    this.latest_tool_output = "";
+    this.current_task = "";
+    this.latest_sub_agents_response = "";
   };
 
   pushCommand = (command: string) => {
@@ -67,14 +86,13 @@ export class Agent extends EventEmitter {
   };
 
   executeNextCommand = async () => {
-    const nextCommand = this.pending_commands.shift();
-    if (
-      !nextCommand &&
-      this.latest_tool_output.length === 0 &&
-      this.latest_sub_agents_response.length === 0
-    )
-      return;
+    const continuing =
+      this.latest_tool_output.length > 0 ||
+      this.latest_sub_agents_response.length > 0;
 
+    const nextCommand = continuing ? undefined : this.pending_commands.shift();
+
+    if (!nextCommand && !continuing) return;
     if (nextCommand) this.current_task = nextCommand;
 
     const finalprompt = getAgentprompt(
@@ -84,7 +102,6 @@ export class Agent extends EventEmitter {
       this.latest_sub_agents_response,
     );
 
-    // After feeding the previous tools output, it's reset back to empty
     this.latest_tool_output = "";
     this.latest_sub_agents_response = "";
 
@@ -107,6 +124,10 @@ export class Agent extends EventEmitter {
     if (this.loop_running) return;
     this.loop_running = true;
 
+    let iterations = 0;
+    let last_tools_signature = "";
+    let repeat_count = 0;
+
     try {
       while (
         this.pending_commands.length > 0 ||
@@ -118,12 +139,40 @@ export class Agent extends EventEmitter {
           break;
         }
 
+        if (++iterations > MAX_ITERATIONS) {
+          this.endRun(
+            `Stopped after ${MAX_ITERATIONS} iterations without calling finish — aborting to avoid an infinite loop.`,
+          );
+          break;
+        }
+
         const response = await this.executeNextCommand();
 
         const tools_to_use = extractXmlContent(
           "TOOLS_TO_USE",
           response as string,
         );
+
+        // Repetition guard: a model stuck re-issuing the same tool call (and
+        // never calling finish) keeps latest_tool_output non-empty and would
+        // loop forever. Bail after MAX_TOOL_REPEATS identical calls in a row.
+        const tools_signature = (tools_to_use ?? "").trim();
+        if (
+          tools_signature.length > 0 &&
+          tools_signature === last_tools_signature
+        ) {
+          repeat_count++;
+        } else {
+          repeat_count = 1;
+          last_tools_signature = tools_signature;
+        }
+        if (repeat_count >= MAX_TOOL_REPEATS) {
+          this.endRun(
+            `Stopped: the same tool call was repeated ${repeat_count} times without finishing.`,
+          );
+          break;
+        }
+
         const summary = extractXmlContent("SUMMARY", response as string);
 
         const chat_response = extractXmlContent("RESPONSE", response as string);
@@ -171,17 +220,11 @@ export class Agent extends EventEmitter {
 
             const finish_message = getFinishMessage(tools_to_use);
             if (finish_message !== null) {
-              this.result =
+              this.endRun(
                 finish_message.trim().length > 0
                   ? finish_message
-                  : "Task complete.";
-              this.emit(
-                this.type == AGENT_TYPE.AGENT ? "parent" : "swarm",
-                `> ${this.result}`,
+                  : "Task complete.",
               );
-              this.latest_tool_output = "";
-              this.current_task = "";
-              this.latest_sub_agents_response = "";
               break;
             }
           }

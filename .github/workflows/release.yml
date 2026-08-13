@@ -1,0 +1,51 @@
+name: release
+
+# Build standalone, no-Node-required binaries for every platform and attach them
+# to a GitHub Release. @yao-pkg/pkg cross-compiles all targets from one runner,
+# so a single Linux job produces macOS, Linux and Windows executables.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {} # manual build (uploads artifacts, no release)
+
+permissions:
+  contents: write # required to create the release and upload assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build standalone binaries
+        run: pnpm build:binaries
+
+      - name: Generate checksums
+        working-directory: binaries
+        run: sha256sum crack-head-* > SHA256SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crack-head-binaries
+          path: binaries/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: binaries/*
+          generate_release_notes: true

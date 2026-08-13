@@ -59,7 +59,8 @@ program
         agentX.pushCommand(opts.direct);
         await agentX.loop();
       } else {
-        // Launch TUI
+        const { startTui } = await import("./tui/App.js");
+        startTui();
       }
     } catch (err) {
       logError(undefined, err);

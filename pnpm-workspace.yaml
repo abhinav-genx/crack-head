@@ -1,4 +1,4 @@
 allowBuilds:
-  esbuild: false
+  esbuild: true
 overrides:
   crack-head: 'link:'

@@ -10,10 +10,28 @@
   <img alt="Providers" src="https://img.shields.io/badge/LLM%20providers-12-8A2BE2">
 </p>
 
+## Quick start
+
+Install the prebuilt binary — **no Node required** — with one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abhinav-genx/crack-head/main/install.sh | sh
+```
+
+Then set a provider key and give it a task:
+
+```bash
+crack-head set-provider open-ai sk-your-key-here
+crack-head --direct "Explain the architecture of this repository"
+```
+
+<sub>Windows or building from source? See [Installation](#installation).</sub>
+
 ---
 
 ## Table of Contents
 
+- [Quick start](#quick-start)
 - [Overview](#overview)
 - [Features](#features)
 - [Architecture](#architecture)
@@ -77,13 +95,49 @@ flowchart TD
 
 ## Requirements
 
+**Running the prebuilt binary** (recommended): none. The Node.js runtime is bundled into the executable — you only need a supported OS (macOS, Linux, or Windows) and an API key for at least one [provider](#supported-providers).
+
+**Building from source / development:**
+
 - **Node.js** ≥ 20 (the project is pure ESM)
 - **pnpm** ≥ 11
-- An API key for at least one supported [provider](#supported-providers)
 
-## Installation
+### Quick install (recommended — no Node required)
 
-crack-head is installed from source and exposed as a global `crack-head` command.
+Download a prebuilt, self-contained binary for your platform and put it on your `PATH`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abhinav-genx/crack-head/main/install.sh | sh
+```
+
+The script detects your OS/architecture, downloads the matching binary from the [latest release](https://github.com/abhinav-genx/crack-head/releases/latest), and installs it to `~/.local/bin`. Supported: macOS (Apple Silicon & Intel) and Linux (x64 & arm64).
+
+Tune the install with environment variables:
+
+| Variable                 | Default            | Purpose                                    |
+| ------------------------ | ------------------ | ------------------------------------------ |
+| `CRACK_HEAD_VERSION`     | `latest`           | Install a specific tag, e.g. `v1.2.0`.     |
+| `CRACK_HEAD_INSTALL_DIR` | `$HOME/.local/bin` | Where to install the `crack-head` binary.  |
+
+```bash
+# Example: pin a version and install to /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/abhinav-genx/crack-head/main/install.sh \
+  | CRACK_HEAD_VERSION=v1.0.0 CRACK_HEAD_INSTALL_DIR=/usr/local/bin sh
+```
+
+**Windows:** download `crack-head-windows-x64.exe` from the [releases page](https://github.com/abhinav-genx/crack-head/releases/latest) and add it to your `PATH`.
+
+Verify the install:
+
+```bash
+crack-head --help
+```
+
+To uninstall, delete the binary (e.g. `rm ~/.local/bin/crack-head`).
+
+### From source (for development)
+
+Requires Node.js ≥ 20 and pnpm ≥ 11.
 
 ```bash
 # 1. Clone the repository
@@ -98,12 +152,6 @@ pnpm build
 
 # 4. Link the `crack-head` binary globally
 pnpm link --global
-```
-
-Verify the install:
-
-```bash
-crack-head --help
 ```
 
 > **Note:** After editing anything under `src/`, run `pnpm build` again so the global command picks up your changes.
@@ -258,10 +306,16 @@ pnpm dev --direct "your task here"
 pnpm build
 ```
 
-| Script       | Action                                  |
-| ------------ | --------------------------------------- |
-| `pnpm dev`   | Run the CLI from source with `tsx`.     |
-| `pnpm build` | Compile TypeScript to `dist/`.          |
+| Script                | Action                                                        |
+| --------------------- | ------------------------------------------------------------- |
+| `pnpm dev`            | Run the CLI from source with `tsx`.                           |
+| `pnpm build`          | Compile TypeScript to `dist/`.                                |
+| `pnpm bundle`         | Bundle `dist/` into a single file with esbuild.               |
+| `pnpm build:binaries` | Build standalone binaries for all platforms into `binaries/`. |
+
+### Building standalone binaries
+
+`pnpm build:binaries` compiles the app into self-contained executables (no Node required at runtime) for macOS, Linux, and Windows using [esbuild](https://esbuild.github.io/) + [@yao-pkg/pkg](https://github.com/yao-pkg/pkg). All targets cross-compile from a single machine, and the outputs land in `binaries/`. CI runs the same command on every `v*` tag (see [.github/workflows/release.yml](.github/workflows/release.yml)) and attaches the binaries to the GitHub Release that `install.sh` downloads from.
 
 ## Security
 

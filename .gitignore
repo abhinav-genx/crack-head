@@ -8,6 +8,9 @@ dist/
 build/
 *.tsbuildinfo
 
+# Packaged standalone binaries (produced by `pnpm build:binaries`)
+binaries/
+
 # Logs
 logs/
 *.log
