@@ -13,6 +13,10 @@ import {
   logError,
   runAction,
 } from "./utils/errors.js";
+import {
+  loadConversation,
+  saveConversation,
+} from "./utils/conversation-store.js";
 
 const program = new Command();
 
@@ -37,13 +41,51 @@ const assertValidProvider = (provider: string): void => {
   }
 };
 
+/**
+ * Resolve the --use-tools value into raw XML.
+ * "-" reads stdin, "@path" reads a file, anything else is treated as literal XML.
+ * File/stdin input sidesteps shell mangling of <, >, ! and CDATA in complex XML.
+ */
+const resolveToolsInput = async (value: string): Promise<string> => {
+  if (value === "-") {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+    return Buffer.concat(chunks).toString("utf8");
+  }
+  if (value.startsWith("@")) {
+    const { readFile } = await import("node:fs/promises");
+    return readFile(value.slice(1), "utf8");
+  }
+  return value;
+};
+
 program
   .name("crack-head")
   .description("AI Coding Agent with cracked head")
   .option("-D, --direct <prompt>", "one-shot answer, no TUI")
+  .option(
+    "-i, --id <id>",
+    "persist this conversation under <id>; reuse it as context if it already exists",
+  )
+  .option(
+    "-t, --use-tools <xml>",
+    "execute <TOOL> blocks directly and print the output, bypassing the model. Pass raw XML, @file to read a file, or - to read stdin",
+  )
   .version("1.0.0")
   .action(async (opts) => {
     try {
+      if (opts.useTools) {
+        const { executeTools } = await import("./tools/index.js");
+        const { extractXmlContent } = await import("./utils/xml-utils.js");
+        const raw = await resolveToolsInput(opts.useTools);
+        // Accept either the bare <TOOL> blocks or a full <TOOLS_TO_USE> wrapper.
+        const toolsXml = extractXmlContent("TOOLS_TO_USE", raw) ?? raw;
+        const output = await executeTools(toolsXml);
+        console.log(
+          output.trim().length > 0 ? output : "[SYSTEM] : no tools executed",
+        );
+        return;
+      }
       if (opts.direct || opts.ask) {
         const { Agent } = await import("./agent/parent.js");
         const agentX = new Agent();
@@ -56,8 +98,23 @@ program
           process.exitCode = 1;
         });
 
+        if (opts.id) {
+          const prior = loadConversation(opts.id);
+          if (prior.length > 0) {
+            agentX.seedConversation(prior);
+            console.log(
+              `[SYSTEM] : resuming conversation "${opts.id}" (${prior.length} prior messages)`,
+            );
+          }
+        }
+
         agentX.pushCommand(opts.direct);
         await agentX.loop();
+
+        if (opts.id) {
+          saveConversation(opts.id, agentX.conversations);
+          console.log(`[SYSTEM] : saved conversation "${opts.id}"`);
+        }
       } else {
         const { startTui } = await import("./tui/App.js");
         startTui();
@@ -111,6 +168,9 @@ Examples:
   $ crack-head set-model gpt-4o                set the active model
   $ crack-head remove-provider open-ai         delete a provider's stored API key
   $ crack-head --direct "explain this repo"    one-shot answer without the TUI
+  $ crack-head -D "add tests" --id my-task      persist/resume a conversation by id
+  $ crack-head --use-tools @tools.xml           run tool XML from a file, no model
+  $ crack-head --use-tools - < tools.xml        run tool XML from stdin, no model
 
 Providers:
   ${VALID_PROVIDERS.join(", ")}`,

@@ -216,6 +216,7 @@ crack-head --direct "Explain the architecture of this repository"
 | Command                                | Description                                                  |
 | -------------------------------------- | ----------------------------------------------------------- |
 | `crack-head --direct <prompt>`         | Run a one-shot task and stream the result (alias: `-D`).    |
+| `crack-head --use-tools <xml>`         | Execute tool XML directly, skipping the model (alias: `-t`). |
 | `crack-head set-provider <slug> <key>` | Set the active provider and store its API key.              |
 | `crack-head set-model <model>`         | Set the active model.                                       |
 | `crack-head remove-provider <slug>`    | Delete a provider's stored API key.                         |
@@ -242,6 +243,55 @@ Agent activity is streamed to your terminal, tagged by source:
 [SWARM]  : ...    # sub-agents running in parallel
 [SYSTEM] : ...    # lifecycle / status messages
 ```
+
+### Running tools directly (`--use-tools`)
+
+Execute one or more `<TOOL>` blocks straight away — bypassing the model entirely — and print the raw `<TOOL_OUTPUT>`. Handy for scripting, debugging tool parsers, or replaying a tool call the agent emitted.
+
+The XML is the same format the agent produces inside `<TOOLS_TO_USE>`; you can pass either the bare `<TOOL>` blocks or a full `<TOOLS_TO_USE>` wrapper. Input can come from three sources:
+
+| Value        | Source                        |
+| ------------ | ----------------------------- |
+| raw string   | literal XML passed on the CLI |
+| `@path`      | read the XML from a file      |
+| `-`          | read the XML from stdin       |
+
+Because tool XML contains `<`, `>`, `!`, and `<![CDATA[ ... ]]>`, passing it as a raw shell argument is error-prone (in zsh, `!` triggers history expansion — `event not found`). **Prefer stdin or a file:**
+
+```bash
+# From stdin via a quoted heredoc (no shell expansion — the safest option)
+crack-head --use-tools - <<'EOF'
+<TOOL>
+<NAME>patch-files</NAME>
+<FILE>
+<FILE_NAME>summary.txt</FILE_NAME>
+<PATCH>
+<OLD_STR><![CDATA[]]></OLD_STR>
+<NEW_STR><![CDATA[Hello from crack-head!]]></NEW_STR>
+</PATCH>
+</FILE>
+</TOOL>
+EOF
+
+# From a file
+crack-head --use-tools @tools.xml
+
+# As a single-quoted literal (use real newlines, not \n)
+crack-head --use-tools '<TOOL><NAME>list-files</NAME></TOOL>'
+```
+
+Each executed tool prints a `<TOOL_OUTPUT>` block:
+
+```xml
+<TOOL_OUTPUT>
+<TOOL_NAME>patch-files</TOOL_NAME>
+<OUTPUT><![CDATA[
+summary.txt: OK — created — 1 patch(es) applied
+]]></OUTPUT>
+</TOOL_OUTPUT>
+```
+
+See [Tools](#tools) for the full list of tools and their XML schemas.
 
 ## How It Works
 

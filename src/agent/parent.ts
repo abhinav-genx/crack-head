@@ -7,17 +7,13 @@ import {
   getFinishMessage,
 } from "../tools/index.js";
 import { extractAllXmlContent, extractXmlContent } from "../utils/xml-utils.js";
+import type { Message } from "../providers/openai-compatible.js";
 import { executeAgentSwarm, formatSwarmEvent } from "./execute-agent-swarm.js";
 
 // Hard caps so a model that keeps calling tools without ever calling finish
 // can't loop forever (and can't wedge the swarm that awaits it).
 const MAX_ITERATIONS = 25;
 const MAX_TOOL_REPEATS = 3;
-
-type Message = {
-  role: "system" | "user" | "assistant";
-  content: string;
-};
 
 export enum AGENT_TYPE {
   AGENT,
@@ -83,6 +79,14 @@ export class Agent extends EventEmitter {
   pushCommand = (command: string) => {
     if (!command || command.length == 0) return;
     this.pending_commands.push(command);
+  };
+
+  // Seed the agent with a prior conversation so a resumed run keeps its context.
+  // The fresh system prompt stays at index 0; only user/assistant turns are added.
+  seedConversation = (messages: Message[]) => {
+    for (const message of messages) {
+      if (message.role !== "system") this.conversations.push(message);
+    }
   };
 
   executeNextCommand = async () => {
