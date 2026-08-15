@@ -1,11 +1,12 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import {
   extractAllXmlContent,
   extractXmlText,
 } from "../utils/xml-utils.js";
 
 export type PatchOp = {
-  old_str: string; // exact text to find (must be unique in file). "" = append/create
+  old_str: string; // exact text to find (must be unique in file). "" = create/overwrite whole file
   new_str: string; // replacement text. "" = delete old_str
 };
 
@@ -37,7 +38,7 @@ Rules:
 - ALWAYS wrap OLD_STR and NEW_STR content in <![CDATA[ ... ]]> so whitespace, newlines, quotes and code survive exactly.
 - To delete text, set NEW_STR to an empty CDATA: <![CDATA[]]>.
 - To insert text, set OLD_STR to an existing adjacent line(s) and include it in NEW_STR along with the new text.
-- If OLD_STR is empty the file is created (or NEW_STR appended if it exists).
+- If OLD_STR is empty the file is created or OVERWRITTEN with NEW_STR (idempotent — re-running the same create does not duplicate content). Parent folders are created automatically.
 - NEVER include line-number prefixes (like "12→") from read output in OLD_STR — they are not part of the file.
 
 Example input (edit two files: fix a bug, delete a log line, create a new file):
@@ -84,9 +85,9 @@ type PatchResult = {
 };
 
 const applyOp = (content: string, op: PatchOp): string => {
-  // Empty old_str → append (used for file creation)
+  // Empty old_str -> (over)write the whole file with new_str (idempotent create).
   if (op.old_str === "") {
-    return content + op.new_str;
+    return op.new_str;
   }
 
   const first = content.indexOf(op.old_str);
@@ -131,6 +132,7 @@ export const patchFilesTool = async (patches: Patch[]): Promise<PatchResult[]> =
         applied++;
       }
 
+      await mkdir(dirname(patch.file_name), { recursive: true });
       await writeFile(patch.file_name, content, "utf8");
       results.push({
         file_name: patch.file_name,
