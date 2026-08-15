@@ -61,7 +61,7 @@ The agent is model-agnostic. A single unified `chat()` interface fronts twelve p
 - **Autonomous agent loop** with summary-based memory, repetition guards, and a bounded iteration budget.
 - **Parallel sub-agent swarms** — fan work out to multiple agents and collect their results.
 - **Rich tool set** — read, patch, search, list, and run code (see [Tools](#tools)).
-- **Background process manager** — start/stop/inspect long-lived processes (dev servers, watchers) that outlive a single command, with automatic cleanup so nothing is orphaned.
+- **Background process manager** — start/stop/inspect long-lived processes (dev servers, watchers). Process state is persisted on disk, so a process started in one `--use-tools` call is still there to inspect or `stop` in the next; stop them explicitly when you're done.
 - **XML tool protocol** — a strict, parseable request/response format that keeps smaller models on rails.
 - **Persistent, secure config** — provider, model, and API keys stored locally at `~/.config/crack-head/config.json` with `0600` permissions.
 - **One-shot mode** — pipe a prompt straight in with `--direct` for scripting and CI.
@@ -291,6 +291,8 @@ summary.txt: OK — created — 1 patch(es) applied
 </TOOL_OUTPUT>
 ```
 
+> **State persists between calls.** Each `--use-tools` run is a separate process, but `background-shell` keeps its process registry and logs on disk (`~/.crack-head/bg`) — so you can `start` a server in one call and read its `logs` or `stop` it in a later one.
+
 See [Tools](#tools) for the full list of tools and their XML schemas.
 
 ## How It Works
@@ -311,11 +313,11 @@ Every tool is invoked through the XML protocol and owns its own parser.
 | Tool               | Purpose                                                                        |
 | ------------------ | ------------------------------------------------------------------------------ |
 | `read-files`       | Read the contents of one or more files.                                        |
-| `patch-files`      | Apply targeted edits/patches to files.                                         |
+| `patch-files`      | Apply search/replace edits to files; creates missing parent directories, and an empty `OLD_STR` creates or overwrites the file.                     |
 | `search-code`      | Regex ("grep"-style) search across the codebase.                               |
 | `list-files`       | List files via glob patterns and render directory trees.                       |
 | `use-shell`        | Run a non-interactive shell command with a timeout.                            |
-| `background-shell` | Manage long-lived processes — `start`, `logs`, `list`, `stop`. Auto-cleaned up on exit. |
+| `background-shell` | Manage long-lived processes — `start`, `logs`, `list`, `stop`. State persists on disk (`~/.crack-head/bg`) so processes survive across separate CLI invocations; `stop` them explicitly. |
 | `finish`           | Signal task completion with a final summary message.                           |
 
 Shared filesystem helpers skip `node_modules`, `.git`, `dist`, and `build` when walking the tree.

@@ -11,7 +11,7 @@ export interface CrackHeadConfig {
 
 export const DEFAULT_CONFIG: CrackHeadConfig = {
   provider: "open-router",
-  model: "gpt-4o-mini",
+  model: "anthropic/claude-opus-5",
   apiKeys: {},
 };
 

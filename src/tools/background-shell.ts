@@ -1,4 +1,15 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { extractXmlText } from "../utils/xml-utils.js";
 
 type BgAction = "start" | "logs" | "list" | "stop";
@@ -11,16 +22,16 @@ type BackgroundShellConfig = {
   settle_ms?: number; // how long to watch a freshly started process
 };
 
-type BgProcess = {
+// State is persisted on disk (metadata + a log file per process) so it survives
+// across separate CLI invocations — crack-head --use-tools spawns a fresh,
+// short-lived process per tool call, so any in-memory registry would be lost.
+type Meta = {
   id: number;
   command: string;
   cwd: string;
-  child: ChildProcess;
-  output: string; // rolling buffer of combined stdout+stderr
-  status: "running" | "exited";
-  exitCode: number | null;
-  signal: NodeJS.Signals | null;
+  pid: number;
   startedAt: number;
+  stopped?: boolean;
 };
 
 /** Parse the inner XML of a background-shell <TOOL> block into a config. */
@@ -45,12 +56,12 @@ export const parseBackgroundShellXml = (
   };
 };
 
-export const background_shell_tool_description = `Start and manage long-lived background processes (dev servers, watchers, queues) that never exit on their own. Unlike use-shell, these are NOT killed by a timeout — they keep running so you can start a server, hit it, and read its logs. All background processes are killed automatically when the run ends.
+export const background_shell_tool_description = `Start and manage long-lived background processes (dev servers, watchers, queues) that never exit on their own. Unlike use-shell, these are NOT killed by a timeout — they keep running so you can start a server, hit it, and read its logs. Background processes PERSIST across tool calls; stop them explicitly with the 'stop' action when you are done.
 
 Pick an <ACTION>:
 - start: spawn <COMMAND> in the background. Returns a numbered PROCESS_ID plus whatever it printed in the first ~1.5s (so you can tell if it booted or crashed on startup). Optional <CWD> and <SETTLE_MS> (how long to watch startup, max 15000).
 - logs: read everything a process has printed so far. Requires <PROCESS_ID>. Use this after 'start' to check a server is ready before you curl it.
-- list: show every background process with its status (running / exited) and command.
+- list: show every background process with its status (running / exited / stopped) and command.
 - stop: terminate a process (SIGTERM, then SIGKILL). Requires <PROCESS_ID>. Kills the whole process tree.
 
 Guidance:
@@ -85,7 +96,7 @@ Example input (check its logs, then stop it):
 </TOOL>
 
 Example output (start where the command crashed on boot):
-Background process #2 exited during the first 1500ms — exited (code 1).
+Background process #2 exited during the first 1500ms — exited.
 It did not stay up. Read the output below to see why (this usually means the command crashed on startup).
 --- output (first 1500ms) ---
 Error: Cannot find module 'express'`;
@@ -95,68 +106,96 @@ const DEFAULT_SETTLE_MS = 1_500;
 const MAX_SETTLE_MS = 15_000;
 const STOP_GRACE_MS = 2_000;
 
-let nextId = 1;
-const processes = new Map<number, BgProcess>();
+// All state lives under ~/.crack-head/bg so it persists across CLI invocations.
+const STATE_DIR = join(homedir(), ".crack-head", "bg");
+const metaPath = (id: number): string => join(STATE_DIR, `${id}.json`);
+const logPath = (id: number): string => join(STATE_DIR, `${id}.log`);
+const counterPath = (): string => join(STATE_DIR, ".next");
 
-const appendOutput = (p: BgProcess, chunk: string): void => {
-  p.output += chunk;
-  if (p.output.length > MAX_OUTPUT_CHARS)
-    p.output = p.output.slice(p.output.length - MAX_OUTPUT_CHARS);
+const ensureStateDir = (): void => {
+  if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
 };
 
-const uptime = (p: BgProcess): string => {
-  const secs = Math.floor((Date.now() - p.startedAt) / 1000);
-  if (secs < 60) return `${secs}s`;
-  return `${Math.floor(secs / 60)}m${secs % 60}s`;
-};
-
-const statusLine = (p: BgProcess): string =>
-  p.status === "running"
-    ? `running (pid ${p.child.pid}, up ${uptime(p)})`
-    : `exited (code ${p.exitCode ?? "?"}${p.signal ? `, signal ${p.signal}` : ""})`;
-
-// Read status through a call so TS doesn't wrongly narrow it across an await
-// (the 'exit' handler can flip it to "exited" while we're waiting).
-const hasExited = (p: BgProcess): boolean => p.status === "exited";
-
-/** Detach a child stdio pipe from the event loop (they're sockets at runtime). */
-const unrefStream = (s: unknown): void => {
-  (s as { unref?: () => void } | null)?.unref?.();
-};
-
-/** Kill the process's whole group (it's a detached group leader) with a fallback. */
-const killTree = (p: BgProcess, signal: NodeJS.Signals): void => {
-  const pid = p.child.pid;
-  if (pid == null) return;
+/** Monotonic id from a counter file so ids are never reused across calls. */
+const nextId = (): number => {
+  ensureStateDir();
+  let n = 1;
   try {
-    process.kill(-pid, signal); // negative pid → the whole process group
+    n = Number(readFileSync(counterPath(), "utf8")) || 1;
+  } catch {
+    n = 1;
+  }
+  writeFileSync(counterPath(), String(n + 1), "utf8");
+  return n;
+};
+
+const readMeta = (id: number): Meta | null => {
+  try {
+    return JSON.parse(readFileSync(metaPath(id), "utf8")) as Meta;
+  } catch {
+    return null;
+  }
+};
+
+const writeMeta = (meta: Meta): void => {
+  ensureStateDir();
+  writeFileSync(metaPath(meta.id), JSON.stringify(meta), "utf8");
+};
+
+const listMetas = (): Meta[] => {
+  ensureStateDir();
+  const metas: Meta[] = [];
+  for (const f of readdirSync(STATE_DIR)) {
+    if (!f.endsWith(".json")) continue;
+    const m = readMeta(Number(f.slice(0, -5)));
+    if (m) metas.push(m);
+  }
+  return metas.sort((a, b) => a.id - b.id);
+};
+
+/** A pid is alive if signal 0 succeeds (or fails with EPERM, not ESRCH). */
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+const uptime = (startedAt: number): string => {
+  const secs = Math.floor((Date.now() - startedAt) / 1000);
+  return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m${secs % 60}s`;
+};
+
+const statusLine = (m: Meta): string => {
+  if (m.stopped) return "stopped";
+  return isAlive(m.pid)
+    ? `running (pid ${m.pid}, up ${uptime(m.startedAt)})`
+    : "exited";
+};
+
+const readLog = (id: number): string => {
+  let out = "";
+  try {
+    out = readFileSync(logPath(id), "utf8");
+  } catch {
+    return "";
+  }
+  return out.length > MAX_OUTPUT_CHARS ? out.slice(-MAX_OUTPUT_CHARS) : out;
+};
+
+/** Kill the whole process group (the child is a detached group leader). */
+const killTree = (pid: number, signal: NodeJS.Signals): void => {
+  try {
+    process.kill(-pid, signal);
   } catch {
     try {
-      p.child.kill(signal);
+      process.kill(pid, signal);
     } catch {
       // already gone
     }
   }
-};
-
-let cleanupRegistered = false;
-/** Ensure background processes never outlive the CLI (no orphaned dev servers). */
-const registerCleanup = (): void => {
-  if (cleanupRegistered) return;
-  cleanupRegistered = true;
-  const killAll = (): void => {
-    for (const p of processes.values())
-      if (p.status === "running") killTree(p, "SIGKILL");
-  };
-  process.on("exit", killAll);
-  process.on("SIGINT", () => {
-    killAll();
-    process.exit(130);
-  });
-  process.on("SIGTERM", () => {
-    killAll();
-    process.exit(143);
-  });
 };
 
 const startProcess = async (cfg: BackgroundShellConfig): Promise<string> => {
@@ -164,46 +203,25 @@ const startProcess = async (cfg: BackgroundShellConfig): Promise<string> => {
   if (!command) throw new Error("action 'start' requires a <COMMAND>.");
   const cwd = cfg.cwd ?? process.cwd();
 
+  ensureStateDir();
+  const id = nextId();
+  const out = openSync(logPath(id), "a"); // child writes stdout+stderr here
+
   const child = spawn(command, {
     cwd,
     shell: "/bin/bash",
-    detached: true, // own process group so stop/cleanup can kill the whole tree
-    stdio: ["ignore", "pipe", "pipe"],
+    detached: true, // own process group; survives the CLI exiting
+    stdio: ["ignore", out, out],
     env: { ...process.env, NO_COLOR: "1", CI: "1" },
   });
-
-  const id = nextId++;
-  const proc: BgProcess = {
-    id,
-    command,
-    cwd,
-    child,
-    output: "",
-    status: "running",
-    exitCode: null,
-    signal: null,
-    startedAt: Date.now(),
-  };
-  processes.set(id, proc);
-  registerCleanup();
-
-  child.stdout?.on("data", (d: Buffer) => appendOutput(proc, d.toString()));
-  child.stderr?.on("data", (d: Buffer) => appendOutput(proc, d.toString()));
-  child.on("exit", (code, signal) => {
-    proc.status = "exited";
-    proc.exitCode = code;
-    proc.signal = signal;
-  });
-  child.on("error", (err) => {
-    appendOutput(proc, `\n[spawn error] ${err.message}\n`);
-    proc.status = "exited";
-    if (proc.exitCode == null) proc.exitCode = -1;
-  });
-
-  // Don't let the child's pipes keep the CLI's event loop alive after the run.
+  const pid = child.pid;
   child.unref();
-  unrefStream(child.stdout);
-  unrefStream(child.stderr);
+  closeSync(out); // the child inherited its own copy of the fd
+
+  if (pid == null) throw new Error(`failed to spawn: ${command}`);
+
+  const meta: Meta = { id, command, cwd, pid, startedAt: Date.now() };
+  writeMeta(meta);
 
   const settle = Math.min(
     Math.max(cfg.settle_ms ?? DEFAULT_SETTLE_MS, 0),
@@ -211,58 +229,64 @@ const startProcess = async (cfg: BackgroundShellConfig): Promise<string> => {
   );
   await new Promise((r) => setTimeout(r, settle));
 
-  const header =
-    proc.status === "running"
-      ? `Started background process #${id} — ${statusLine(proc)}.\n` +
-        `It keeps running in the background. Use action 'logs' with PROCESS_ID ${id} to read new output, and 'stop' to terminate it.`
-      : `Background process #${id} exited during the first ${settle}ms — ${statusLine(proc)}.\n` +
-        `It did not stay up. Read the output below to see why (this usually means the command crashed on startup).`;
+  const alive = isAlive(pid);
+  const body = readLog(id).trim();
+  const header = alive
+    ? `Started background process #${id} — ${statusLine(meta)}.\n` +
+      `It keeps running in the background. Use action 'logs' with PROCESS_ID ${id} to read new output, and 'stop' to terminate it.`
+    : `Background process #${id} exited during the first ${settle}ms — exited.\n` +
+      `It did not stay up. Read the output below to see why (this usually means the command crashed on startup).`;
 
-  const body =
-    proc.output.trim().length > 0
-      ? `--- output (first ${settle}ms) ---\n${proc.output}`
-      : "(no output yet)";
-
-  return `${header}\n${body}`;
+  return `${header}\n${
+    body.length > 0
+      ? `--- output (first ${settle}ms) ---\n${body}`
+      : "(no output yet)"
+  }`;
 };
 
-const requireProcess = (cfg: BackgroundShellConfig, action: string): BgProcess => {
+const requireMeta = (cfg: BackgroundShellConfig, action: string): Meta => {
   if (cfg.process_id == null)
     throw new Error(`action '${action}' requires a <PROCESS_ID>.`);
-  const p = processes.get(cfg.process_id);
-  if (!p)
+  const m = readMeta(cfg.process_id);
+  if (!m)
     throw new Error(
       `no background process #${cfg.process_id}. Use action 'list' to see started processes.`,
     );
-  return p;
+  return m;
 };
 
 const getLogs = (cfg: BackgroundShellConfig): string => {
-  const p = requireProcess(cfg, "logs");
-  const body = p.output.trim().length > 0 ? p.output : "(no output captured yet)";
-  return `Background process #${p.id}: ${p.command}\nstatus: ${statusLine(p)}\n--- output ---\n${body}`;
+  const m = requireMeta(cfg, "logs");
+  const body = readLog(m.id).trim();
+  return `Background process #${m.id}: ${m.command}\nstatus: ${statusLine(
+    m,
+  )}\n--- output ---\n${body.length > 0 ? body : "(no output captured yet)"}`;
 };
 
 const listProcesses = (): string => {
-  if (processes.size === 0) return "No background processes have been started.";
-  const lines = [...processes.values()].map(
-    (p) => `#${p.id}  [${statusLine(p)}]  ${p.command}  (cwd: ${p.cwd})`,
+  const metas = listMetas();
+  if (metas.length === 0) return "No background processes have been started.";
+  const lines = metas.map(
+    (m) => `#${m.id}  [${statusLine(m)}]  ${m.command}  (cwd: ${m.cwd})`,
   );
-  return `${processes.size} background process(es):\n${lines.join("\n")}`;
+  return `${metas.length} background process(es):\n${lines.join("\n")}`;
 };
 
 const stopProcess = async (cfg: BackgroundShellConfig): Promise<string> => {
-  const p = requireProcess(cfg, "stop");
-  if (hasExited(p))
-    return `Background process #${p.id} already exited — ${statusLine(p)}.`;
+  const m = requireMeta(cfg, "stop");
+  if (m.stopped || !isAlive(m.pid)) {
+    if (!m.stopped) writeMeta({ ...m, stopped: true });
+    return `Background process #${m.id} already exited — ${statusLine(m)}.`;
+  }
 
-  killTree(p, "SIGTERM");
+  killTree(m.pid, "SIGTERM");
   await new Promise((r) => setTimeout(r, STOP_GRACE_MS));
-  if (!hasExited(p)) killTree(p, "SIGKILL");
+  if (isAlive(m.pid)) killTree(m.pid, "SIGKILL");
 
-  return hasExited(p)
-    ? `Stopped background process #${p.id} — ${statusLine(p)}.`
-    : `Sent SIGKILL to background process #${p.id}; it should exit momentarily.`;
+  writeMeta({ ...m, stopped: true });
+  return isAlive(m.pid)
+    ? `Sent SIGKILL to background process #${m.id}; it should exit momentarily.`
+    : `Stopped background process #${m.id}.`;
 };
 
 export const backgroundShellTool = async (
